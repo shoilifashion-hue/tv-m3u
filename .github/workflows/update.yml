@@ -1,7 +1,7 @@
 name: Update IPTV Playlist
 
 on:
-  # গিটহাব ড্যাশবোর্ড থেকে ম্যানুয়ালি রান করার অপশন
+  # গিটহাব ড্যাশবোর্ড থেকে ম্যানুয়ালি রান করার অপশন
   workflow_dispatch:
 
   # প্রতি ৬ ঘণ্টা পর পর অটো রান হবে
@@ -23,7 +23,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
