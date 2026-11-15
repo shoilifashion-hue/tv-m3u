@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
+from urllib.parse import urljoin
 import httpx
 
 # কনফিগারেশন ও রুট পাথ
@@ -30,7 +32,7 @@ HEADERS = {
     "Accept": "*/*"
 }
 
-# সার্ভার রেট-লিমিট যেন না দেয় সেজন্য সেমাফোর ৫ রাখা হয়েছে
+# সার্ভার যাতে রেট-লিমিট না দেয় সেজন্য সেমাফোর ৫ রাখা হয়েছে
 SEMAPHORE = asyncio.Semaphore(5)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
@@ -66,7 +68,6 @@ async def fetch_channels_raw(client: httpx.AsyncClient) -> list[dict]:
                     })
                     current_extinf = None
             elif line.startswith("http"):
-                # যদি কোনো চ্যানেলের সরাসরি ইউআরএল থাকে
                 if current_extinf:
                     channels.append({
                         "extinf": current_extinf,
@@ -82,11 +83,17 @@ async def fetch_channels_raw(client: httpx.AsyncClient) -> list[dict]:
 
 
 async def resolve_channel_stream(client: httpx.AsyncClient, channel: dict) -> dict | None:
-    """প্রতিটি চ্যানেলের gw টোকেন দিয়ে /api/play থেকে রিয়েল স্ট্রিমিং URL আনা"""
+    """
+    টোকেন দিয়ে /api/play কল করে /s/ মাস্টার লিঙ্ক নেওয়া,
+    এবং তা থেকে সরাসরি প্লেয়াবল /r/ স্ট্রিম লিঙ্ক বের করা।
+    """
     if "direct_url" in channel:
+        direct = channel["direct_url"]
+        if "/s/" in direct:
+            direct = direct.replace("/s/", "/r/")
         return {
             "extinf": channel["extinf"],
-            "url": channel["direct_url"]
+            "url": direct
         }
 
     token = channel.get("token")
@@ -95,20 +102,59 @@ async def resolve_channel_stream(client: httpx.AsyncClient, channel: dict) -> di
 
     async with SEMAPHORE:
         try:
+            # ধাপ ১: /api/play থেকে প্রাথমিক URL নেওয়া
             params = {"c": token}
             resp = await client.get(PLAY_API, params=params, headers=HEADERS, timeout=12.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                stream_url = data.get("url")
-                if stream_url:
-                    return {
-                        "extinf": channel["extinf"],
-                        "url": stream_url
-                    }
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            initial_url = data.get("url")
+            if not initial_url:
+                return None
+
+            # ধাপ ২: /s/ মাস্টার ফাইল ফেচ করে আসল /r/ স্ট্রিম লিঙ্কটি বের করা
+            final_stream_url = None
+            try:
+                manifest_resp = await client.get(initial_url, headers=HEADERS, timeout=10.0)
+                if manifest_resp.status_code == 200:
+                    text = manifest_resp.text
+                    # মাস্টার ফাইলে থাকা /r/ লিঙ্ক খোঁজা
+                    r_match = re.search(r'(https?://[^\s"\'<>]*/r/[^\s"\'<>]+)', text)
+                    if r_match:
+                        final_stream_url = r_match.group(1).strip()
+                    else:
+                        for line in text.splitlines():
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                final_stream_url = urljoin(initial_url, line)
+                                break
+            except Exception:
+                pass
+
+            # যদি কোনো কারণে মাস্টার ফেচ না হয়, তবে সরাসরি /s/ কে /r/ দিয়ে রূপান্তর করা
+            if not final_stream_url:
+                if "/s/" in initial_url:
+                    final_stream_url = initial_url.replace("/s/", "/r/")
+                else:
+                    final_stream_url = initial_url
+
+            # নিশ্চিত করা যেন লিঙ্কটি সরাসরি /r/ হয়
+            if "/s/" in final_stream_url:
+                final_stream_url = final_stream_url.replace("/s/", "/r/")
+
+            # লিঙ্কটির শেষে .m3u8 নিশ্চিত করা
+            if not final_stream_url.endswith(".m3u8") and "?" not in final_stream_url:
+                final_stream_url += ".m3u8"
+
+            return {
+                "extinf": channel["extinf"],
+                "url": final_stream_url
+            }
+
         except Exception as e:
             log.debug(f"Error resolving token: {e}")
-
-        return None
+            return None
 
 
 async def main():
@@ -119,14 +165,14 @@ async def main():
             log.warning("No channels found! Exiting.")
             return
 
-        log.info(f"Resolving real stream URLs for {len(raw_channels)} channels...")
+        log.info(f"Resolving real playable /r/ streams for {len(raw_channels)} channels...")
         tasks = [resolve_channel_stream(client, ch) for ch in raw_channels]
         resolved_results = await asyncio.gather(*tasks)
 
         valid_streams = [res for res in resolved_results if res is not None]
-        log.info(f"Successfully resolved {len(valid_streams)} playable streams.")
+        log.info(f"Successfully resolved {len(valid_streams)} playable /r/ streams.")
 
-        # ১. M3U প্লেলিস্ট তৈরি (হেডার পাইপ সহ যেন সব প্লেয়ারে সাপোর্ট করে)
+        # M3U প্লেলিস্ট ও JSON তৈরি
         m3u_lines = ["#EXTM3U"]
         json_data = []
 
@@ -134,11 +180,12 @@ async def main():
             extinf = item["extinf"]
             stream_url = item["url"]
 
-            # প্লেয়ারের জন্য রেফারার ও ইউজার এজেন্ট বাইন্ডিং
+            # যেকোনো আইপিটিভি প্লেয়ারের জন্য পাইপলাইন হেডার বাইন্ডিং
             play_link = f"{stream_url}|Referer={REFERER_URL}&Origin={ORIGIN_URL}&User-Agent={USER_AGENT}"
 
             m3u_lines.append(extinf)
             m3u_lines.append(f"#EXTVLCOPT:http-referrer={REFERER_URL}")
+            m3u_lines.append(f"#EXTVLCOPT:http-origin={ORIGIN_URL}")
             m3u_lines.append(f"#EXTVLCOPT:http-user-agent={USER_AGENT}")
             m3u_lines.append(play_link)
 
@@ -152,7 +199,7 @@ async def main():
         M3U_OUTPUT.write_text("\n".join(m3u_lines) + "\n", encoding="utf-8")
         JSON_OUTPUT.write_text(json.dumps(json_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        log.info(f"Saved {len(valid_streams)} channels to {M3U_OUTPUT.name} and {JSON_OUTPUT.name}.")
+        log.info(f"Saved {len(valid_streams)} playable channels to {M3U_OUTPUT.name} and {JSON_OUTPUT.name}.")
 
 
 if __name__ == "__main__":
