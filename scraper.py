@@ -32,10 +32,49 @@ HEADERS = {
     "Accept": "*/*"
 }
 
+# ক্লাউডফ্লেয়ার যাতে কোনো রিকোয়েস্ট ড্রপ না করে সেজন্য সেমাফোর ৫ রাখা হয়েছে
 SEMAPHORE = asyncio.Semaphore(5)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 log = logging.getLogger("IPTV_SCRAPER")
+
+
+def extract_first_r_stream(manifest_text: str, base_url: str) -> str | None:
+    """
+    মাস্টার প্লেলিস্টে একাধিক /r/ লিঙ্ক থাকলে строго একদম প্রথম (Primary) লিঙ্কটি বের করে।
+    """
+    if not manifest_text:
+        return None
+
+    # ১. লাইন বাই লাইন স্ক্যান করে কমেন্ট (#) বাদে প্রথম /r/ লিঙ্কটি গ্রহণ
+    lines = [line.strip() for line in manifest_text.splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("#"):
+            continue
+        full_candidate = urljoin(base_url, line)
+        if "/r/" in full_candidate:
+            clean_url = full_candidate.strip("\"' ")
+            if not clean_url.endswith(".m3u8") and "?" not in clean_url:
+                clean_url += ".m3u8"
+            return clean_url
+
+    # ২. রেজেক্স দিয়ে টেক্সট থেকে ক্রমানুসারে প্রথম /r/ ম্যাচটি খোঁজা (রিলেটিভ বা ফুল ডোমেইন)
+    pattern = r'((?:https?://[^\s"\'<>]+)?/r/[^\s"\'<>]+\.m3u8(?:\?[^\s"\'<>]*)?)'
+    match = re.search(pattern, manifest_text)
+    if match:
+        clean_url = urljoin(base_url, match.group(1).strip("\"' "))
+        return clean_url
+
+    # ৩. এক্সটেনশন ছাড়া থাকলে সেটির ফলব্যাক
+    pattern_fallback = r'((?:https?://[^\s"\'<>]+)?/r/[^\s"\'<>]+)'
+    match_fallback = re.search(pattern_fallback, manifest_text)
+    if match_fallback:
+        clean_url = urljoin(base_url, match_fallback.group(1).strip("\"' "))
+        if not clean_url.endswith(".m3u8") and "?" not in clean_url:
+            clean_url += ".m3u8"
+        return clean_url
+
+    return None
 
 
 async def fetch_channels_raw(client: httpx.AsyncClient) -> list[dict]:
@@ -82,7 +121,7 @@ async def fetch_channels_raw(client: httpx.AsyncClient) -> list[dict]:
 
 
 async def resolve_channel_stream(client: httpx.AsyncClient, channel: dict) -> dict | None:
-    """টোকেন দিয়ে /api/play কল করে সরাসরি /r/ স্ট্রিম লিঙ্ক বের করা"""
+    """টোকেন দিয়ে /api/play কল করে শুধুমাত্র প্রথম /r/ লিঙ্কটি নিশ্চিত করা"""
     if "direct_url" in channel:
         direct = channel["direct_url"]
         if "/s/" in direct:
@@ -98,6 +137,7 @@ async def resolve_channel_stream(client: httpx.AsyncClient, channel: dict) -> di
 
     async with SEMAPHORE:
         try:
+            # ধাপ ১: /api/play কল করে প্রাথমিক মাস্টার URL নেওয়া
             params = {"c": token}
             resp = await client.get(PLAY_API, params=params, headers=HEADERS, timeout=12.0)
             if resp.status_code != 200:
@@ -108,23 +148,16 @@ async def resolve_channel_stream(client: httpx.AsyncClient, channel: dict) -> di
             if not initial_url:
                 return None
 
+            # ধাপ ২: মাস্টার প্লেলিস্ট ফেচ করে সেখান থেকে কেবল সর্বপ্রথম /r/ লিঙ্কটি নেওয়া
             final_stream_url = None
             try:
                 manifest_resp = await client.get(initial_url, headers=HEADERS, timeout=10.0)
                 if manifest_resp.status_code == 200:
-                    text = manifest_resp.text
-                    r_match = re.search(r'(https?://[^\s"\'<>]*/r/[^\s"\'<>]+)', text)
-                    if r_match:
-                        final_stream_url = r_match.group(1).strip()
-                    else:
-                        for line in text.splitlines():
-                            line = line.strip()
-                            if line and not line.startswith("#"):
-                                final_stream_url = urljoin(initial_url, line)
-                                break
+                    final_stream_url = extract_first_r_stream(manifest_resp.text, initial_url)
             except Exception:
                 pass
 
+            # যদি ফেচিং ফেইল করে, সরাসরি রূপান্তর ফলব্যাক
             if not final_stream_url:
                 if "/s/" in initial_url:
                     final_stream_url = initial_url.replace("/s/", "/r/")
@@ -155,28 +188,28 @@ async def main():
             log.warning("No channels found! Exiting.")
             return
 
-        log.info(f"Resolving real playable /r/ streams for {len(raw_channels)} channels...")
+        log.info(f"Extracting 1st primary /r/ stream for {len(raw_channels)} channels...")
         tasks = [resolve_channel_stream(client, ch) for ch in raw_channels]
         resolved_results = await asyncio.gather(*tasks)
 
         valid_streams = [res for res in resolved_results if res is not None]
-        log.info(f"Successfully resolved {len(valid_streams)} playable streams.")
+        log.info(f"Successfully resolved {len(valid_streams)} playable primary streams.")
 
-        # ১. M3U প্লেলিস্ট (শুধুমাত্র #EXTINF এবং ক্লিন লিঙ্ক থাকবে)
+        # ১. M3U প্লেলিস্ট (শুধুমাত্র #EXTINF এবং প্রথম ক্লিন /r/ লিঙ্ক)
         m3u_lines = ["#EXTM3U"]
         
-        # ২. JSON ডেটা (যেখানে সব হেডার ও রেফারার সংরক্ষিত থাকবে)
+        # ২. JSON ডেটা (যেখানে রেফারার ও অন্যান্য ডেটা সংরক্ষিত থাকবে)
         json_data = []
 
         for item in valid_streams:
             extinf = item["extinf"]
             stream_url = item["url"]
 
-            # M3U আউটপুট: শুধু চ্যানেল ইনফো ও ক্লিন লিঙ্ক
+            # M3U আউটপুট: কোনো অতিরিক্ত হেডার বা পাইপ ছাড়া একদম ক্লিন লিঙ্ক
             m3u_lines.append(extinf)
             m3u_lines.append(stream_url)
 
-            # JSON আউটপুট: রেফারার, অরিজিন ও ইউজার-এজেন্ট সহ বিস্তারিত
+            # JSON আউটপুট: সমস্ত হেডার সহ বিস্তারিত ডেটা
             play_link = f"{stream_url}|Referer={REFERER_URL}&Origin={ORIGIN_URL}&User-Agent={USER_AGENT}"
             json_data.append({
                 "info": extinf,
@@ -189,7 +222,7 @@ async def main():
                 }
             })
 
-        # ফাইল সেভ
+        # ফাইল সেভ করা
         M3U_OUTPUT.write_text("\n".join(m3u_lines) + "\n", encoding="utf-8")
         JSON_OUTPUT.write_text(json.dumps(json_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
